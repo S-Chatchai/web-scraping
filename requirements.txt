@@ -7,3 +7,7 @@ streamlit==1.56.0
 google-generativeai
 python-dotenv
 
+# Database
+pymongo
+dnspython
+
