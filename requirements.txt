@@ -1,15 +1,9 @@
 # Core Web App
 streamlit==1.56.0
 
-# Scraping & NLP
-Crawl4AI==0.8.6
-beautifulsoup4
-pythainlp
+
 
 # AI & LLM
 google-generativeai
 python-dotenv
 
-# Essential for Crawl4AI/Playwright
-playwright
-playwright-stealth
