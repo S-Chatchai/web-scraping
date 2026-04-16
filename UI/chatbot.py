@@ -1,0 +1,195 @@
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from pymongo import MongoClient
+from sentence_transformers import SentenceTransformer
+from google import genai
+
+# ==========================================
+# 0. ตั้งค่าหน้าเพจ Streamlit
+# ==========================================
+st.set_page_config(page_title="AI Stock Assistant", page_icon="📈", layout="centered")
+
+# โหลด Environment Variables
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGODB_URI")
+GEMINI_KEYS_ENV = os.getenv("GEMINI_API_KEYS", "")
+
+# แปลง String จาก .env เป็น List
+API_KEYS = [key.strip() for key in GEMINI_KEYS_ENV.split(",") if key.strip()]
+
+if not API_KEYS or not MONGO_URI:
+    st.error("❌ ไม่พบการตั้งค่า GEMINI_API_KEYS หรือ MONGODB_URI ในไฟล์ .env")
+    st.stop()
+
+# ตัวแปรจำตำแหน่งคีย์ปัจจุบันใน Session State
+if "current_key_index" not in st.session_state:
+    st.session_state.current_key_index = 0
+
+# ==========================================
+# 1. การจัดการ Cache ของ Database และ Model
+# ==========================================
+@st.cache_resource
+def get_database_collection():
+    """เชื่อมต่อ MongoDB แค่ครั้งเดียว"""
+    client = MongoClient(MONGO_URI)
+    return client["finance_db"]["news_articles"]
+
+@st.cache_resource
+def get_embedding_model():
+    """โหลดโมเดล BAAI/bge-m3 แค่ครั้งเดียว"""
+    return SentenceTransformer('BAAI/bge-m3')
+
+# ==========================================
+# 2. ฟังก์ชันหลักสำหรับ AI และ RAG
+# ==========================================
+def generate_content_with_retry(prompt):
+    """ฟังก์ชันเรียก Gemini API แบบมีระบบ Auto-Retry"""
+    max_retries = len(API_KEYS) 
+    
+    for attempt in range(max_retries):
+        current_key = API_KEYS[st.session_state.current_key_index]
+        
+        try:
+            client = genai.Client(api_key=current_key)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash-lite', 
+                contents=prompt
+            )
+            # เลื่อนไปใช้คีย์ถัดไปเพื่อกระจายโควต้า (หรืออาจจะเลื่อนเมื่อพังเท่านั้นก็ได้)
+            st.session_state.current_key_index = (st.session_state.current_key_index + 1) % len(API_KEYS)
+            return response.text
+            
+        except Exception as e:
+            st.session_state.current_key_index = (st.session_state.current_key_index + 1) % len(API_KEYS)
+            if attempt == max_retries - 1:
+                raise Exception(f"❌ API Keys ทั้งหมดโควต้าเต็มหรือเกิดข้อผิดพลาด: {str(e)}")
+
+def extract_ticker(query):
+    """ใช้ Gemini API วิเคราะห์ชื่อย่อหุ้น"""
+    prompt = f"""
+    คุณคือระบบสกัดข้อมูล (Entity Extractor) ที่เชี่ยวชาญตลาดหุ้นไทย
+    จงอ่านคำถามของผู้ใช้ แล้วดึง "ชื่อย่อหุ้น (Ticker)" ออกมา
+    
+    กฎ:
+    1. ตอบเป็นชื่อย่อหุ้นภาษาอังกฤษตัวพิมพ์ใหญ่เท่านั้น (เช่น PTT, KTB)
+    2. หากเป็นชื่อภาษาไทย ให้แปลงเป็นชื่อย่อ (เช่น กรุงไทย -> KTB)
+    3. หากไม่มีชื่อหุ้น ให้ตอบ "NONE"
+    
+    คำถาม: "{query}"
+    ชื่อหุ้น:
+    """
+    ticker_text = generate_content_with_retry(prompt)
+    return ticker_text.strip().upper()
+
+def query_rag_system(collection, embed_model, query):
+    """รัน RAG Pipeline และคืนค่าคำตอบกลับไปที่ UI"""
+    with st.status("กำลังประมวลผลข้อมูล...", expanded=True) as status:
+        st.write("🔍 สกัดชื่อหุ้นจากคำถาม...")
+        target_ticker = extract_ticker(query)
+        
+        filter_query = {}
+        if target_ticker != "NONE" and len(target_ticker) < 10:
+            st.write(f"🎯 กำหนดเป้าหมายการค้นหา: **[{target_ticker}]**")
+            filter_query = { "tickers": { "$in": [target_ticker] } }
+        else:
+            st.write("🌐 ค้นหาข้อมูลจากข่าวการลงทุนทั้งหมด")
+
+        st.write("⏳ กำลังสร้าง Vector ข้อมูล...")
+        query_vector = embed_model.encode(query, normalize_embeddings=True).tolist()
+
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index", 
+                    "path": "embedding",
+                    "queryVector": query_vector,
+                    "numCandidates": 100,
+                    "limit": 5
+                }
+            }
+        ]
+        
+        if filter_query:
+            pipeline[0]["$vectorSearch"]["filter"] = filter_query
+            
+        pipeline.append({
+            "$project": {
+                "_id": 0, 
+                "title": 1, 
+                "content": 1,
+                "link": 1,
+                
+            }
+        })
+
+        st.write("🔍 กำลังค้นหาข้อมูลที่เกี่ยวข้องจาก Database...")
+        results = list(collection.aggregate(pipeline))
+
+        if not results:
+            status.update(label="การค้นหาเสร็จสิ้น (ไม่พบข้อมูล)", state="error")
+            return "❌ ไม่พบข้อมูลข่าวที่เกี่ยวข้องในระบบฐานข้อมูล"
+
+        st.write("🧠 กำลังให้ AI สังเคราะห์คำตอบ...")
+        context_text = "\n\n".join(
+            [f"หัวข้อ: {doc['title']}\nเนื้อหา: {doc.get('content', '')}\nลิงก์อ้างอิง: {doc.get('link', 'ไม่มีลิงก์')}" 
+             for doc in results]
+        )
+        
+        prompt = f"""
+        คุณคือผู้ช่วยนักวิเคราะห์การลงทุน ตอบคำถามจากข้อมูลที่กำหนดให้เท่านั้น
+        หากไม่มีคำตอบ ให้บอกว่า "ไม่พบข้อมูลที่แน่ชัด"
+
+        ข้อบังคับสำคัญ: 
+        - ต้องสรุปคำตอบให้อ่านเข้าใจง่าย
+        - **ต้องอ้างอิงลิงก์ที่มา (Link) แนบท้ายข้อมูลหรือข่าวที่คุณใช้ตอบเสมอ** (เช่น [อ่านเพิ่มเติม](https://...))
+
+        [ข้อมูลอ้างอิง]:
+        {context_text}
+
+        [คำถามผู้ใช้]: 
+        {query}
+        """
+        
+        final_answer = generate_content_with_retry(prompt)
+        status.update(label="ประมวลผลสำเร็จ!", state="complete", expanded=False)
+        
+        return final_answer
+
+# ==========================================
+# 3. ส่วนการออกแบบ UI (Streamlit Layout)
+# ==========================================
+st.title("📈 AI Stock RAG Assistant")
+st.markdown("ระบบวิเคราะห์ข่าวสารและหุ้นไทยด้วยเทคโนโลยี AI Vector Search")
+
+# โหลดทรัพยากร
+collection = get_database_collection()
+embed_model = get_embedding_model()
+
+# เก็บประวัติการแชท
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "assistant", "content": "สวัสดีครับ ต้องการให้ช่วยหาข่าวหรือวิเคราะห์หุ้นตัวไหน พิมพ์ถามมาได้เลยครับ"}
+    ]
+
+# แสดงประวัติการสนทนาทั้งหมด
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# กล่องรับข้อความผู้ใช้งาน
+if user_question := st.chat_input("พิมพ์คำถามของคุณที่นี่ เช่น 'ฉันอยากซื้อหุ้นน้ำมัน แนะนำตัวไหนบ้าง?'"):
+    # นำข้อความผู้ใช้แสดงบนหน้าจอ
+    st.session_state.messages.append({"role": "user", "content": user_question})
+    with st.chat_message("user"):
+        st.markdown(user_question)
+
+    # ให้ AI ตอบสนอง
+    with st.chat_message("assistant"):
+        try:
+            response = query_rag_system(collection, embed_model, user_question)
+            st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+        except Exception as e:
+            st.error(f"เกิดข้อผิดพลาด: {e}")
