@@ -1,4 +1,3 @@
-import os
 import streamlit as st
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
