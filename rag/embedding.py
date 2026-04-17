@@ -6,7 +6,7 @@ def main():
     # ==========================================
     # 1. ตั้งค่าการเชื่อมต่อ MongoDB Atlas
     # ==========================================
-    MONGO_URI = "mongodb+srv://ser96385_db_user:cLhtpD2Z0bTLcaHq@cluster0.8a65ugc.mongodb.net/finance_db?appName=Cluster0"
+    MONGO_URI = ""
     
     try:
         client = MongoClient(MONGO_URI)
