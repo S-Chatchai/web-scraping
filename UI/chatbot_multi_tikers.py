@@ -57,7 +57,7 @@ def generate_content_with_retry(prompt):
                 model='gemini-2.5-flash-lite', 
                 contents=prompt
             )
-            # เลื่อนไปใช้คีย์ถัดไปเพื่อกระจายโควต้า (หรืออาจจะเลื่อนเมื่อพังเท่านั้นก็ได้)
+            # เลื่อนไปใช้คีย์ถัดไปเพื่อกระจายโควต้า
             st.session_state.current_key_index = (st.session_state.current_key_index + 1) % len(API_KEYS)
             return response.text
             
@@ -75,7 +75,7 @@ def extract_ticker(query):
     กฎ:
     1. ตอบเป็นชื่อย่อหุ้นภาษาอังกฤษตัวพิมพ์ใหญ่เท่านั้น
     2. หากมีหุ้นหลายตัว ให้คั่นด้วยเครื่องหมายจุลภาค (comma) เช่น PTT, SCC, KBANK
-    3. **สำคัญมาก:** หากผู้ใช้ถามถึง "กลุ่มอุตสาหกรรม" หรือ "หมวดหมู่" (เช่น หุ้นน้ำมัน, หุ้นโรงพยาบาล, หุ้นธนาคาร) ให้คุณดึงชื่อย่อหุ้นตัวท็อปๆ ในกลุ่มนั้นมา 3-5 ตัว คั่นด้วยจุลภาค เช่น PTT, PTTEP, TOP, BCP, SPRC
+    3. **สำคัญมาก:** หากผู้ใช้ถามถึง "กลุ่มอุตสาหกรรม" หรือ "หมวดหมู่" ให้คุณดึงชื่อย่อหุ้นตัวท็อปๆ ในกลุ่มนั้นมา 3-5 ตัว เช่น PTT, PTTEP, TOP, BCP
     4. หากเป็นชื่อภาษาไทย ให้แปลงเป็นชื่อย่อ (เช่น กรุงไทย -> KTB)
     5. หากไม่มีชื่อหุ้น และไม่สามารถตีความกลุ่มอุตสาหกรรมได้เลย ให้ตอบ "NONE"
     
@@ -92,19 +92,23 @@ def query_rag_system(collection, embed_model, query):
         extracted_text = extract_ticker(query)
         
         filter_query = {}
+        search_query = query # ตั้งค่าเริ่มต้นของคำค้นหา
+        
         if extracted_text != "NONE" and extracted_text != "":
-            # แปลงข้อความที่มี comma คั่น ให้กลายเป็น List
             ticker_list = [t.strip() for t in extracted_text.split(",") if t.strip()]
             
             if ticker_list:
                 st.write(f"🎯 กำหนดเป้าหมายการค้นหา: **[{', '.join(ticker_list)}]**")
-                # ใช้ $in กับ List ของ Tickers ทั้งหมด
                 filter_query = { "tickers": { "$in": ticker_list } }
+                
+                # 💡 [เพิ่มใหม่] Query Expansion: เอาชื่อหุ้นมาต่อท้ายคำถาม เพื่อให้ Vector แม่นยำขึ้นมากๆ
+                search_query = f"{query} ข้อมูลของหุ้น {', '.join(ticker_list)}"
         else:
             st.write("🌐 ค้นหาข้อมูลจากข่าวการลงทุนทั้งหมด")
 
         st.write("⏳ กำลังสร้าง Vector ข้อมูล...")
-        query_vector = embed_model.encode(query, normalize_embeddings=True).tolist()
+        # ใช้ search_query ที่อาจจะถูกเติมชื่อหุ้นเข้าไปแล้ว แทนที่จะใช้ query สั้นๆ ของผู้ใช้
+        query_vector = embed_model.encode(search_query, normalize_embeddings=True).tolist()
 
         pipeline = [
             {
@@ -112,8 +116,8 @@ def query_rag_system(collection, embed_model, query):
                     "index": "vector_index", 
                     "path": "embedding",
                     "queryVector": query_vector,
-                    "numCandidates": 150, # เพิ่มให้ครอบคลุมหุ้นหลายตัว
-                    "limit": 10           # เพิ่มลิมิตเพื่อดึงข้อมูลมาเปรียบเทียบได้เยอะขึ้น
+                    "numCandidates": 150, 
+                    "limit": 10           
                 }
             }
         ]
@@ -127,7 +131,7 @@ def query_rag_system(collection, embed_model, query):
                 "title": 1, 
                 "content": 1,
                 "link": 1,
-                
+                # "date": 1 # 💡 ในอนาคตถ้า Database คุณมีฟิลด์วันที่ ควรดึงมาด้วยเพื่อให้ AI อ้างอิง
             }
         })
 
@@ -188,12 +192,10 @@ for msg in st.session_state.messages:
 
 # กล่องรับข้อความผู้ใช้งาน
 if user_question := st.chat_input("พิมพ์คำถามของคุณที่นี่ เช่น 'ฉันอยากซื้อหุ้นน้ำมัน แนะนำตัวไหนบ้าง?'"):
-    # นำข้อความผู้ใช้แสดงบนหน้าจอ
     st.session_state.messages.append({"role": "user", "content": user_question})
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    # ให้ AI ตอบสนอง
     with st.chat_message("assistant"):
         try:
             response = query_rag_system(collection, embed_model, user_question)
